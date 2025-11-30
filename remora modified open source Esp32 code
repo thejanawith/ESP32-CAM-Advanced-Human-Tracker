@@ -1,0 +1,1165 @@
+/*********
+ * ESP32-CAM Advanced Human Tracker
+ * Optical Flow + Kalman Filter + Multi-Object Tracking
+ * 
+ * Features:
+ * ✅ Real optical flow motion detection
+ * ✅ Kalman filtering for smooth tracking
+ * ✅ Multi-object tracking capability
+ * ✅ Velocity-based prediction
+ * ✅ Robust serial communication
+ * 
+ * GitHub: https://github.com/yourusername/ESP32-CAM-Advanced-Human-Tracker
+ * 
+ * Connections:
+ * ESP32-CAM TX (GPIO15) -> Arduino Mega RX1 (Pin 19)
+ * ESP32-CAM RX (GPIO14) -> Arduino Mega TX1 (Pin 18)
+ * GND -> GND
+ * 
+ * License: MIT
+ * Author: Your Name
+ * Version: 2.0
+ * Date: October 2024
+ *********/
+
+#include "esp_camera.h"
+#include "Arduino.h"
+
+// ========================================
+// HARDWARE CONFIGURATION
+// ========================================
+
+// Serial Communication
+#define RXD2 14
+#define TXD2 15
+
+// Camera Resolution
+#define WIDTH 160
+#define HEIGHT 120
+#define BLOCK_SIZE 4  // Smaller blocks for better accuracy
+#define W (WIDTH / BLOCK_SIZE)    // 40 blocks
+#define H (HEIGHT / BLOCK_SIZE)   // 30 blocks
+
+// Camera Pins (ESP32-CAM)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ========================================
+// ALGORITHM PARAMETERS
+// ========================================
+
+// Optical Flow Parameters
+#define FLOW_SEARCH_RANGE 3      // Search radius for block matching
+#define FLOW_THRESHOLD 2.0       // Minimum quality for flow vectors
+#define MIN_FLOW_POINTS 5        // Minimum points to consider valid motion
+
+// Kalman Filter Parameters
+#define KALMAN_Q 0.1             // Process noise
+#define KALMAN_R 2.0             // Measurement noise
+
+// Tracking Parameters
+#define MAX_TRACKS 3             // Maximum objects to track simultaneously
+#define TRACK_TIMEOUT 30         // Frames before inactive track is removed
+#define MIN_TRACK_CONFIDENCE 0.3 // Minimum confidence to consider track valid
+#define MAX_TRACK_CONFIDENCE 1.0 // Maximum confidence value
+
+// Human Detection Parameters
+#define MIN_HUMAN_SIZE 8         // Minimum object size (in blocks)
+#define MAX_HUMAN_SIZE 120       // Maximum object size (in blocks)
+#define HUMAN_ASPECT_MIN 0.5     // Minimum height/width ratio
+#define HUMAN_ASPECT_MAX 3.0     // Maximum height/width ratio
+
+// Movement Control
+#define PREDICTION_HORIZON 3     // Frames to predict ahead
+#define LEFT_BOUNDARY_PCT 0.35   // 35% from left -> turn left
+#define RIGHT_BOUNDARY_PCT 0.65  // 65% from left -> turn right
+
+// ========================================
+// DATA STRUCTURES
+// ========================================
+
+/**
+ * @brief Optical flow vector structure
+ * Represents motion between frames for a single block
+ */
+struct FlowVector {
+  float x;           // X-component of motion
+  float y;           // Y-component of motion  
+  float magnitude;   // Overall motion strength
+  bool valid;        // Whether this vector is reliable
+};
+
+/**
+ * @brief Kalman filter for 1D tracking
+ * Used for smoothing position and velocity
+ */
+struct KalmanFilter {
+  float x;      // State (position)
+  float v;      // Velocity
+  float p;      // Error covariance
+  float q;      // Process noise
+  float r;      // Measurement noise
+};
+
+/**
+ * @brief Tracked object structure
+ * Represents a human or moving object being tracked
+ */
+struct TrackedObject {
+  float x, y;           // Current position (block coordinates)
+  float vx, vy;         // Velocity (blocks/frame)
+  float width, height;  // Object dimensions
+  int id;               // Unique identifier
+  int age;              // How long tracked (frames)
+  float confidence;     // Tracking confidence [0,1]
+  KalmanFilter kf_x;    // Kalman filter for X axis
+  KalmanFilter kf_y;    // Kalman filter for Y axis
+  bool active;          // Whether track is currently active
+};
+
+// ========================================
+// GLOBAL VARIABLES
+// ========================================
+
+// Frame buffers
+uint8_t currentFrame[H][W];
+uint8_t previousFrame[H][W];
+
+// Optical flow field
+FlowVector flowField[H][W];
+
+// Object tracking
+TrackedObject tracks[MAX_TRACKS];
+int nextTrackId = 1;
+
+// System state
+String currentDirection = "S";
+int frameCounter = 0;
+bool debugMode = true;
+bool visualOutput = false;
+
+// ========================================
+// CORE SETUP FUNCTION
+// ========================================
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  
+  // Display startup banner
+  displayStartupBanner();
+  
+  // Initialize camera
+  if (!initializeCamera()) {
+    Serial.println("❌ CRITICAL: Camera initialization failed!");
+    Serial.println("   Please check camera connection and pins.");
+    while(true) {
+      delay(1000);
+    }
+  }
+  
+  // Initialize tracking system
+  initializeTrackingSystem();
+  
+  Serial.println("✅ System initialized successfully");
+  Serial.println("🚀 Starting advanced human tracking...\n");
+  
+  delay(1000);
+}
+
+/**
+ * @brief Display startup information and banner
+ */
+void displayStartupBanner() {
+  Serial.println("\n╔════════════════════════════════════════════════╗");
+  Serial.println("║           ESP32-CAM ADVANCED TRACKER           ║");
+  Serial.println("║          Optical Flow + Kalman Filter          ║");
+  Serial.println("╚════════════════════════════════════════════════╝\n");
+  
+  Serial.println("📊 ALGORITHMS USED:");
+  Serial.println("  ✓ Optical Flow (Lucas-Kanade variant)");
+  Serial.println("  ✓ Kalman Filter for state estimation");
+  Serial.println("  ✓ Connected Components for object detection");
+  Serial.println("  ✓ Multi-Object Tracking with data association");
+  Serial.println("  ✓ Velocity-based movement prediction\n");
+  
+  Serial.println("🎮 COMMANDS:");
+  Serial.println("  I - System information");
+  Serial.println("  D - Toggle debug mode");
+  Serial.println("  V - Toggle visual output");
+  Serial.println("  R - Reset tracking system");
+  Serial.println("  T - Test serial communication\n");
+}
+
+/**
+ * @brief Initialize the camera hardware
+ * @return true if successful, false otherwise
+ */
+bool initializeCamera() {
+  camera_config_t config;
+  
+  // Configure camera pins
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  
+  // Camera settings
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  
+  // Initialize and return status
+  return esp_camera_init(&config) == ESP_OK;
+}
+
+/**
+ * @brief Initialize the tracking system
+ */
+void initializeTrackingSystem() {
+  // Initialize all tracks as inactive
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    initializeTrack(&tracks[i]);
+  }
+  
+  Serial.println("✅ Tracking system initialized");
+  Serial.println("✅ Kalman filters ready");
+  Serial.println("✅ Optical flow system active");
+}
+
+/**
+ * @brief Initialize a single track
+ * @param track Pointer to track to initialize
+ */
+void initializeTrack(TrackedObject* track) {
+  track->active = false;
+  track->id = -1;
+  track->age = 0;
+  track->confidence = 0.0;
+  track->x = track->y = 0;
+  track->vx = track->vy = 0;
+  track->width = track->height = 0;
+  
+  // Initialize Kalman filters
+  initializeKalman(&track->kf_x);
+  initializeKalman(&track->kf_y);
+}
+
+/**
+ * @brief Initialize a Kalman filter
+ * @param kf Pointer to Kalman filter to initialize
+ */
+void initializeKalman(KalmanFilter* kf) {
+  kf->x = 0;
+  kf->v = 0;
+  kf->p = 1.0;
+  kf->q = KALMAN_Q;
+  kf->r = KALMAN_R;
+}
+
+// ========================================
+// MAIN PROCESSING LOOP
+// ========================================
+
+void loop() {
+  static unsigned long lastProcessTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Process at 8-10 FPS (100ms interval)
+  if (currentTime - lastProcessTime < 100) {
+    delay(5);
+    return;
+  }
+  lastProcessTime = currentTime;
+  
+  // Handle user commands
+  if (Serial.available()) {
+    handleUserCommand(Serial.read());
+  }
+  
+  // Capture new frame
+  if (!captureFrame()) {
+    Serial.println("⚠️  Frame capture failed - retrying...");
+    return;
+  }
+  
+  frameCounter++;
+  
+  // Skip processing for first frame (need previous frame for optical flow)
+  if (frameCounter == 1) {
+    memcpy(previousFrame, currentFrame, sizeof(currentFrame));
+    return;
+  }
+  
+  // 🎯 ADVANCED PROCESSING PIPELINE
+  processAdvancedTrackingPipeline();
+  
+  // Store current frame for next iteration
+  memcpy(previousFrame, currentFrame, sizeof(currentFrame));
+}
+
+/**
+ * @brief Complete advanced tracking pipeline
+ */
+void processAdvancedTrackingPipeline() {
+  // 1. Compute optical flow between frames
+  computeOpticalFlow();
+  
+  // 2. Detect motion regions using connected components
+  std::vector<TrackedObject> detections = detectMotionRegions();
+  
+  // 3. Update multi-object tracking with data association
+  updateMultiObjectTracking(detections);
+  
+  // 4. Select best human candidate for following
+  TrackedObject* bestHuman = selectBestHumanCandidate();
+  
+  // 5. Determine movement direction with prediction
+  determineMovementDirection(bestHuman);
+  
+  // 6. Send command to Arduino Mega
+  sendMovementCommand();
+  
+  // 7. Output debugging information
+  if (debugMode && frameCounter % 10 == 0) {
+    outputTrackingStatus(bestHuman);
+  }
+  
+  // 8. Optional visual output
+  if (visualOutput && frameCounter % 15 == 0) {
+    displayVisualTracking();
+  }
+}
+
+// ========================================
+// OPTICAL FLOW IMPLEMENTATION
+// ========================================
+
+/**
+ * @brief Compute optical flow between current and previous frame
+ * Uses block matching algorithm (simplified Lucas-Kanade)
+ */
+void computeOpticalFlow() {
+  // Clear previous flow field
+  memset(flowField, 0, sizeof(flowField));
+  
+  // Process each block in the frame (skip borders)
+  for (int y = FLOW_SEARCH_RANGE; y < H - FLOW_SEARCH_RANGE; y++) {
+    for (int x = FLOW_SEARCH_RANGE; x < W - FLOW_SEARCH_RANGE; x++) {
+      FlowVector bestFlow = {0, 0, 0, false};
+      float bestMatchError = 999999.0;
+      
+      // Search for best matching block in neighborhood
+      for (int dy = -FLOW_SEARCH_RANGE; dy <= FLOW_SEARCH_RANGE; dy++) {
+        for (int dx = -FLOW_SEARCH_RANGE; dx <= FLOW_SEARCH_RANGE; dx++) {
+          // Skip zero motion (current position)
+          if (dx == 0 && dy == 0) continue;
+          
+          int neighborX = x + dx;
+          int neighborY = y + dy;
+          
+          // Check bounds
+          if (neighborX < 0 || neighborX >= W || neighborY < 0 || neighborY >= H) continue;
+          
+          // Compute similarity between blocks
+          float matchError = computeBlockSimilarity(x, y, neighborX, neighborY);
+          
+          // Update best match if better
+          if (matchError < bestMatchError) {
+            bestMatchError = matchError;
+            bestFlow.x = dx;
+            bestFlow.y = dy;
+            bestFlow.magnitude = sqrt(dx*dx + dy*dy);
+            bestFlow.valid = true;
+          }
+        }
+      }
+      
+      // Only accept reliable flow vectors
+      if (bestFlow.valid && bestMatchError < FLOW_THRESHOLD) {
+        flowField[y][x] = bestFlow;
+      }
+    }
+  }
+  
+  if (debugMode && frameCounter % 20 == 0) {
+    Serial.printf("🔍 Optical flow computed - vectors: %d\n", countValidFlowVectors());
+  }
+}
+
+/**
+ * @brief Compute similarity between two blocks using Sum of Absolute Differences
+ * @param x1, y1 First block coordinates
+ * @param x2, y2 Second block coordinates  
+ * @return Similarity score (lower = more similar)
+ */
+float computeBlockSimilarity(int x1, int y1, int x2, int y2) {
+  float totalDifference = 0;
+  int comparedPoints = 0;
+  
+  // Compare 3x3 block around each point
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      int px1 = x1 + dx;
+      int py1 = y1 + dy;
+      int px2 = x2 + dx;
+      int py2 = y2 + dy;
+      
+      // Check bounds for both points
+      if (px1 >= 0 && px1 < W && py1 >= 0 && py1 < H &&
+          px2 >= 0 && px2 < W && py2 >= 0 && py2 < H) {
+        int diff = abs((int)currentFrame[py1][px1] - (int)previousFrame[py2][px2]);
+        totalDifference += diff;
+        comparedPoints++;
+      }
+    }
+  }
+  
+  return comparedPoints > 0 ? totalDifference / comparedPoints : 999999.0;
+}
+
+/**
+ * @brief Count valid flow vectors in the field
+ * @return Number of valid vectors
+ */
+int countValidFlowVectors() {
+  int count = 0;
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      if (flowField[y][x].valid) count++;
+    }
+  }
+  return count;
+}
+
+// ========================================
+// MOTION REGION DETECTION
+// ========================================
+
+/**
+ * @brief Detect motion regions using connected components analysis
+ * @return Vector of detected objects
+ */
+std::vector<TrackedObject> detectMotionRegions() {
+  std::vector<TrackedObject> detections;
+  bool visited[H][W] = {false};
+  
+  // Find connected motion regions using flood fill
+  for (int y = 2; y < H - 2; y++) {
+    for (int x = 2; x < W - 2; x++) {
+      if (flowField[y][x].valid && !visited[y][x] && 
+          flowField[y][x].magnitude > 0.5) {
+        
+        TrackedObject region = extractMotionRegion(x, y, visited);
+        
+        if (validateHumanRegion(region)) {
+          detections.push_back(region);
+        }
+      }
+    }
+  }
+  
+  return detections;
+}
+
+/**
+ * @brief Extract a connected motion region using flood fill
+ * @param startX, startY Starting coordinates for flood fill
+ * @param visited Visited points map (modified during flood fill)
+ * @return Extracted region as TrackedObject
+ */
+TrackedObject extractMotionRegion(int startX, int startY, bool visited[H][W]) {
+  TrackedObject region = {0};
+  int pointCount = 0;
+  
+  int minX = W, maxX = 0;
+  int minY = H, maxY = 0;
+  float sumX = 0, sumY = 0;
+  
+  // Stack-based flood fill implementation
+  struct Point { int x, y; };
+  Point stack[W * H];
+  int stackSize = 0;
+  
+  stack[stackSize++] = {startX, startY};
+  
+  while (stackSize > 0) {
+    Point current = stack[--stackSize];
+    
+    // Check bounds and visitation
+    if (current.x < 0 || current.x >= W || current.y < 0 || current.y >= H) continue;
+    if (visited[current.y][current.x] || !flowField[current.y][current.x].valid) continue;
+    
+    // Mark as visited and process
+    visited[current.y][current.x] = true;
+    pointCount++;
+    
+    // Update statistics
+    sumX += current.x;
+    sumY += current.y;
+    
+    // Update bounding box
+    if (current.x < minX) minX = current.x;
+    if (current.x > maxX) maxX = current.x;
+    if (current.y < minY) minY = current.y;
+    if (current.y > maxY) maxY = current.y;
+    
+    // Add neighbors to stack (4-connected)
+    if (stackSize < W * H - 4) {
+      stack[stackSize++] = {current.x-1, current.y};
+      stack[stackSize++] = {current.x+1, current.y};
+      stack[stackSize++] = {current.x, current.y-1};
+      stack[stackSize++] = {current.x, current.y+1};
+    }
+  }
+  
+  // Calculate region properties
+  if (pointCount > 0) {
+    region.x = sumX / pointCount;
+    region.y = sumY / pointCount;
+    region.width = maxX - minX + 1;
+    region.height = maxY - minY + 1;
+    
+    // Calculate region velocity from flow field
+    calculateRegionVelocity(&region);
+    
+    // Calculate initial confidence
+    region.confidence = calculateRegionConfidence(region, pointCount);
+  }
+  
+  return region;
+}
+
+/**
+ * @brief Calculate average velocity for a region
+ * @param region Region to calculate velocity for
+ */
+void calculateRegionVelocity(TrackedObject* region) {
+  region->vx = 0;
+  region->vy = 0;
+  int flowPoints = 0;
+  
+  // Average velocity in 5x5 window around centroid
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      int x = (int)region->x + dx;
+      int y = (int)region->y + dy;
+      
+      if (x >= 0 && x < W && y >= 0 && y < H && flowField[y][x].valid) {
+        region->vx += flowField[y][x].x;
+        region->vy += flowField[y][x].y;
+        flowPoints++;
+      }
+    }
+  }
+  
+  if (flowPoints > 0) {
+    region->vx /= flowPoints;
+    region->vy /= flowPoints;
+  }
+}
+
+/**
+ * @brief Calculate confidence score for a region
+ * @param region Region to score
+ * @param pointCount Number of points in region
+ * @return Confidence score [0,1]
+ */
+float calculateRegionConfidence(TrackedObject region, int pointCount) {
+  float confidence = 0.0;
+  
+  // Size density confidence
+  float density = (float)pointCount / (region.width * region.height);
+  if (density > 0.3 && density < 0.9) {
+    confidence += 0.3;
+  }
+  
+  // Motion consistency confidence
+  float motionStrength = sqrt(region.vx * region.vx + region.vy * region.vy);
+  if (motionStrength > 0.3 && motionStrength < 3.0) {
+    confidence += 0.3;
+  }
+  
+  // Position confidence (prefer center of frame)
+  float centerDistance = abs(region.x - W/2) / (W/2.0);
+  confidence += (1.0 - centerDistance) * 0.2;
+  
+  // Aspect ratio confidence (human-like proportions)
+  float aspectRatio = region.height / max(region.width, 1.0f);
+  if (aspectRatio >= HUMAN_ASPECT_MIN && aspectRatio <= HUMAN_ASPECT_MAX) {
+    confidence += 0.2;
+  }
+  
+  return min(confidence, 1.0f);
+}
+
+/**
+ * @brief Validate if a region resembles a human
+ * @param region Region to validate
+ * @return true if valid human region
+ */
+bool validateHumanRegion(TrackedObject region) {
+  int area = region.width * region.height;
+  
+  // Size validation
+  if (area < MIN_HUMAN_SIZE || area > MAX_HUMAN_SIZE) {
+    return false;
+  }
+  
+  // Aspect ratio validation
+  float aspect = region.height / max(region.width, 1.0f);
+  if (aspect < HUMAN_ASPECT_MIN || aspect > HUMAN_ASPECT_MAX) {
+    return false;
+  }
+  
+  // Minimum confidence
+  if (region.confidence < 0.3) {
+    return false;
+  }
+  
+  return true;
+}
+
+// ========================================
+// KALMAN FILTER IMPLEMENTATION
+// ========================================
+
+/**
+ * @brief Kalman filter prediction step
+ * @param kf Kalman filter to predict
+ * @return Predicted state
+ */
+float kalmanPredict(KalmanFilter* kf) {
+  // State prediction: x = x + v
+  kf->x = kf->x + kf->v;
+  
+  // Error covariance prediction: P = P + Q
+  kf->p = kf->p + kf->q;
+  
+  return kf->x;
+}
+
+/**
+ * @brief Kalman filter update step
+ * @param kf Kalman filter to update
+ * @param measurement New measurement
+ * @return Updated state
+ */
+float kalmanUpdate(KalmanFilter* kf, float measurement) {
+  // Kalman gain: K = P / (P + R)
+  float kalmanGain = kf->p / (kf->p + kf->r);
+  
+  // State update: x = x + K * (measurement - x)
+  kf->x = kf->x + kalmanGain * (measurement - kf->x);
+  
+  // Error covariance update: P = (1 - K) * P
+  kf->p = (1 - kalmanGain) * kf->p;
+  
+  return kf->x;
+}
+
+// ========================================
+// MULTI-OBJECT TRACKING
+// ========================================
+
+/**
+ * @brief Update multi-object tracking with new detections
+ * @param detections Newly detected objects
+ */
+void updateMultiObjectTracking(std::vector<TrackedObject> detections) {
+  // First, update existing tracks
+  updateExistingTracks(detections);
+  
+  // Then, create new tracks for unmatched detections
+  createNewTracks(detections);
+  
+  // Finally, clean up lost tracks
+  cleanupLostTracks();
+}
+
+/**
+ * @brief Update existing tracks with new detections
+ * @param detections New detections (will be modified - matched detections removed)
+ */
+void updateExistingTracks(std::vector<TrackedObject>& detections) {
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (tracks[i].active) {
+      tracks[i].age++;
+      
+      // Predict track position using Kalman filter
+      float predictedX = kalmanPredict(&tracks[i].kf_x);
+      float predictedY = kalmanPredict(&tracks[i].kf_y);
+      
+      // Find best matching detection
+      int bestMatchIndex = findBestDetectionMatch(predictedX, predictedY, detections);
+      
+      if (bestMatchIndex != -1) {
+        // Update track with matched detection
+        updateTrackWithDetection(&tracks[i], detections[bestMatchIndex]);
+        
+        // Remove matched detection
+        detections.erase(detections.begin() + bestMatchIndex);
+      } else {
+        // No detection match - decay confidence
+        tracks[i].confidence = max(tracks[i].confidence - 0.05f, 0.0f);
+      }
+    }
+  }
+}
+
+/**
+ * @brief Find best detection match for a predicted position
+ * @param predX, predY Predicted position
+ * @param detections Available detections
+ * @return Index of best match, or -1 if no good match
+ */
+int findBestDetectionMatch(float predX, float predY, std::vector<TrackedObject>& detections) {
+  int bestMatch = -1;
+  float bestDistance = 9999.0;
+  
+  for (size_t i = 0; i < detections.size(); i++) {
+    float dx = detections[i].x - predX;
+    float dy = detections[i].y - predY;
+    float distance = sqrt(dx*dx + dy*dy);
+    
+    // Gating: only consider matches within 10 blocks
+    if (distance < bestDistance && distance < 10.0) {
+      bestDistance = distance;
+      bestMatch = i;
+    }
+  }
+  
+  return bestMatch;
+}
+
+/**
+ * @brief Update a track with a new detection
+ * @param track Track to update
+ * @param detection New detection data
+ */
+void updateTrackWithDetection(TrackedObject* track, TrackedObject detection) {
+  // Update position with Kalman filter
+  track->x = kalmanUpdate(&track->kf_x, detection.x);
+  track->y = kalmanUpdate(&track->kf_y, detection.y);
+  
+  // Update velocity with smoothing
+  track->vx = (track->vx * 0.7f) + (detection.vx * 0.3f);
+  track->vy = (track->vy * 0.7f) + (detection.vy * 0.3f);
+  
+  // Update size and confidence
+  track->width = detection.width;
+  track->height = detection.height;
+  track->confidence = min(track->confidence + 0.1f, MAX_TRACK_CONFIDENCE);
+}
+
+/**
+ * @brief Create new tracks for unmatched detections
+ * @param detections Unmatched detections
+ */
+void createNewTracks(std::vector<TrackedObject>& detections) {
+  for (size_t i = 0; i < detections.size(); i++) {
+    int freeSlot = findAvailableTrackSlot();
+    if (freeSlot != -1) {
+      initializeNewTrack(&tracks[freeSlot], detections[i]);
+    }
+  }
+}
+
+/**
+ * @brief Find available slot for new track
+ * @return Index of available slot, or -1 if none
+ */
+int findAvailableTrackSlot() {
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (!tracks[i].active) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * @brief Initialize a new track with detection data
+ * @param track Track to initialize
+ * @param detection Detection data
+ */
+void initializeNewTrack(TrackedObject* track, TrackedObject detection) {
+  track->active = true;
+  track->id = nextTrackId++;
+  track->x = detection.x;
+  track->y = detection.y;
+  track->vx = detection.vx;
+  track->vy = detection.vy;
+  track->width = detection.width;
+  track->height = detection.height;
+  track->confidence = detection.confidence;
+  track->age = 0;
+  
+  // Initialize Kalman filters with first measurement
+  track->kf_x.x = detection.x;
+  track->kf_y.x = detection.y;
+}
+
+/**
+ * @brief Clean up lost or expired tracks
+ */
+void cleanupLostTracks() {
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (tracks[i].active && 
+        (tracks[i].confidence < MIN_TRACK_CONFIDENCE || tracks[i].age > TRACK_TIMEOUT)) {
+      if (debugMode) {
+        Serial.printf("🗑️  Removing track %d (conf: %.2f, age: %d)\n", 
+                     tracks[i].id, tracks[i].confidence, tracks[i].age);
+      }
+      tracks[i].active = false;
+    }
+  }
+}
+
+// ========================================
+// HUMAN SELECTION AND MOVEMENT CONTROL
+// ========================================
+
+/**
+ * @brief Select best human candidate for tracking
+ * @return Pointer to best human, or nullptr if none
+ */
+TrackedObject* selectBestHumanCandidate() {
+  TrackedObject* bestCandidate = nullptr;
+  float bestScore = 0.0;
+  
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (tracks[i].active) {
+      // Score based on multiple factors
+      float score = calculateTrackingScore(tracks[i]);
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = &tracks[i];
+      }
+    }
+  }
+  
+  return bestCandidate;
+}
+
+/**
+ * @brief Calculate tracking score for an object
+ * @param track Track to score
+ * @return Comprehensive score [0,1]
+ */
+float calculateTrackingScore(TrackedObject track) {
+  float score = 0.0;
+  
+  // Confidence component (40%)
+  score += track.confidence * 0.4;
+  
+  // Size component (30%)
+  float sizeScore = (track.width * track.height) / (float)MAX_HUMAN_SIZE;
+  score += min(sizeScore, 1.0f) * 0.3;
+  
+  // Position component (20%) - prefer center
+  float positionScore = 1.0 - (abs(track.x - W/2) / (W/2.0));
+  score += positionScore * 0.2;
+  
+  // Age component (10%) - prefer stable tracks
+  float ageScore = min(track.age / 20.0f, 1.0f);
+  score += ageScore * 0.1;
+  
+  return score;
+}
+
+/**
+ * @brief Determine movement direction based on tracked human
+ * @param human Tracked human (can be nullptr)
+ */
+void determineMovementDirection(TrackedObject* human) {
+  if (human == nullptr || human->confidence < MIN_TRACK_CONFIDENCE) {
+    currentDirection = "S";  // Stop - no human tracked
+    return;
+  }
+  
+  // Predict future position based on velocity
+  float predictedX = human->x + human->vx * PREDICTION_HORIZON;
+  
+  // Determine direction based on predicted position
+  if (predictedX < W * LEFT_BOUNDARY_PCT) {
+    currentDirection = "L";  // Turn left
+  } else if (predictedX > W * RIGHT_BOUNDARY_PCT) {
+    currentDirection = "R";  // Turn right
+  } else {
+    currentDirection = "F";  // Move forward
+  }
+}
+
+// ========================================
+// COMMUNICATION AND OUTPUT
+// ========================================
+
+/**
+ * @brief Send movement command to Arduino Mega
+ */
+void sendMovementCommand() {
+  Serial2.print(currentDirection);
+  Serial2.print("\n");
+  Serial2.flush();
+}
+
+/**
+ * @brief Output tracking status to serial
+ * @param human Currently tracked human
+ */
+void outputTrackingStatus(TrackedObject* human) {
+  Serial.print("🎯 ");
+  Serial.print(currentDirection);
+  
+  if (human != nullptr) {
+    Serial.print(" | ID:");
+    Serial.print(human->id);
+    Serial.print(" | Pos:(");
+    Serial.print(human->x, 1);
+    Serial.print(",");
+    Serial.print(human->y, 1);
+    Serial.print(") | Vel:(");
+    Serial.print(human->vx, 2);
+    Serial.print(",");
+    Serial.print(human->vy, 2);
+    Serial.print(") | Conf:");
+    Serial.print(human->confidence, 2);
+  } else {
+    Serial.print(" | No human tracked");
+  }
+  
+  // Show active tracks count
+  int activeCount = countActiveTracks();
+  Serial.print(" | Tracks:");
+  Serial.print(activeCount);
+  
+  Serial.println();
+}
+
+/**
+ * @brief Count active tracks
+ * @return Number of active tracks
+ */
+int countActiveTracks() {
+  int count = 0;
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (tracks[i].active) count++;
+  }
+  return count;
+}
+
+/**
+ * @brief Display visual tracking representation
+ */
+void displayVisualTracking() {
+  Serial.println("\n╔══════════════════════════════╗");
+  Serial.println("║        TRACKING VIEW        ║");
+  Serial.println("╠══════════════════════════════╣");
+  
+  for (int y = 0; y < min(H, 15); y++) {  // Limit height for display
+    Serial.print("║");
+    for (int x = 0; x < min(W, 30); x++) {  // Limit width for display
+      char displayChar = ' ';
+      
+      // Check for tracked objects
+      for (int i = 0; i < MAX_TRACKS; i++) {
+        if (tracks[i].active) {
+          int objX = (int)tracks[i].x;
+          int objY = (int)tracks[i].y;
+          
+          if (x == objX && y == objY) {
+            displayChar = '0' + tracks[i].id;  // Show track ID
+            break;
+          }
+        }
+      }
+      
+      // Check for motion
+      if (displayChar == ' ' && flowField[y][x].valid) {
+        displayChar = '.';
+      }
+      
+      Serial.print(displayChar);
+    }
+    Serial.println("║");
+  }
+  
+  Serial.println("╚══════════════════════════════╝");
+  Serial.printf("Direction: %s | Frame: %d\n\n", currentDirection.c_str(), frameCounter);
+}
+
+// ========================================
+// FRAME CAPTURE FUNCTION
+// ========================================
+
+/**
+ * @brief Capture frame from camera
+ * @return true if successful
+ */
+bool captureFrame() {
+  camera_fb_t *frameBuffer = esp_camera_fb_get();
+  if (!frameBuffer) return false;
+  
+  // Convert camera frame to block-based representation
+  for (int blockY = 0; blockY < H; blockY++) {
+    for (int blockX = 0; blockX < W; blockX++) {
+      long sum = 0;
+      int pixelCount = 0;
+      
+      // Average pixels in each block
+      for (int pixelY = 0; pixelY < BLOCK_SIZE; pixelY++) {
+        for (int pixelX = 0; pixelX < BLOCK_SIZE; pixelX++) {
+          int y = blockY * BLOCK_SIZE + pixelY;
+          int x = blockX * BLOCK_SIZE + pixelX;
+          
+          if (y < HEIGHT && x < WIDTH) {
+            sum += frameBuffer->buf[y * WIDTH + x];
+            pixelCount++;
+          }
+        }
+      }
+      currentFrame[blockY][blockX] = sum / pixelCount;
+    }
+  }
+  
+  esp_camera_fb_return(frameBuffer);
+  return true;
+}
+
+// ========================================
+// USER INTERFACE FUNCTIONS
+// ========================================
+
+/**
+ * @brief Handle user serial commands
+ * @param command Command character
+ */
+void handleUserCommand(char command) {
+  switch(command) {
+    case 'I':
+    case 'i':
+      displaySystemInformation();
+      break;
+      
+    case 'D':
+    case 'd':
+      debugMode = !debugMode;
+      Serial.printf("🔧 Debug mode: %s\n", debugMode ? "ON" : "OFF");
+      break;
+      
+    case 'V':
+    case 'v':
+      visualOutput = !visualOutput;
+      Serial.printf("👁️  Visual output: %s\n", visualOutput ? "ON" : "OFF");
+      break;
+      
+    case 'R':
+    case 'r':
+      resetTrackingSystem();
+      break;
+      
+    case 'T':
+    case 't':
+      testSerialCommunication();
+      break;
+      
+    default:
+      Serial.println("❓ Unknown command. Use I, D, V, R, T");
+      break;
+  }
+}
+
+/**
+ * @brief Display comprehensive system information
+ */
+void displaySystemInformation() {
+  Serial.println("\n📊 SYSTEM INFORMATION");
+  Serial.println("====================");
+  
+  Serial.printf("Frame counter: %d\n", frameCounter);
+  Serial.printf("Active tracks: %d/%d\n", countActiveTracks(), MAX_TRACKS);
+  Serial.printf("Current direction: %s\n", currentDirection.c_str());
+  Serial.printf("Debug mode: %s\n", debugMode ? "ON" : "OFF");
+  Serial.printf("Visual output: %s\n", visualOutput ? "ON" : "OFF");
+  
+  Serial.println("\nACTIVE TRACKS:");
+  Serial.println("-------------");
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (tracks[i].active) {
+      Serial.printf("Track %d: Pos(%.1f,%.1f) Vel(%.2f,%.2f) Conf:%.2f Age:%d\n",
+                   tracks[i].id, tracks[i].x, tracks[i].y, 
+                   tracks[i].vx, tracks[i].vy, tracks[i].confidence, tracks[i].age);
+    }
+  }
+  
+  Serial.println("====================\n");
+}
+
+/**
+ * @brief Reset the tracking system
+ */
+void resetTrackingSystem() {
+  Serial.println("🔄 Resetting tracking system...");
+  
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    initializeTrack(&tracks[i]);
+  }
+  
+  currentDirection = "S";
+  sendMovementCommand();
+  frameCounter = 0;
+  
+  Serial.println("✅ Tracking system reset complete");
+}
+
+/**
+ * @brief Test serial communication with Arduino Mega
+ */
+void testSerialCommunication() {
+  Serial.println("🔌 Testing serial communication...");
+  
+  const char* testCommands[] = {"S", "F", "L", "R"};
+  
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("Sending: %s\n", testCommands[i]);
+    Serial2.print(testCommands[i]);
+    Serial2.print("\n");
+    Serial2.flush();
+    delay(500);
+  }
+  
+  Serial.println("✅ Serial test complete");
+}
