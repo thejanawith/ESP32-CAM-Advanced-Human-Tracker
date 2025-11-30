@@ -1,0 +1,24 @@
+
+## 🎯 Algorithm Overview
+
+1. **Optical Flow** - Lucas-Kanade method for motion detection
+2. **Connected Components** - Group motion pixels into objects
+3. **Kalman Filter** - Predict and smooth object positions
+4. **Data Association** - Match detections with existing tracks
+5. **Velocity Prediction** - Anticipate future positions
+
+## 📥 Installation
+
+1. **ESP32-CAM Setup:**
+   ```bash
+   # Install ESP32 board support in Arduino IDE
+   # Select AI-Thinker ESP32-CAM board
+   # Upload ESP32_CAM_Advanced_Human_Tracker.ino
+
+
+ESP32-CAM Arduino Mega
+╔══════════╗ ╔═══════════╗
+║ TX(15)║───────║ RX1 (19) ║
+║ RX(14)║───────║ TX1 (18) ║
+║ GND ║───────║ GND ║
+╚══════════╝ ╚═══════════╝
